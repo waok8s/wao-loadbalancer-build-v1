@@ -18,6 +18,8 @@ package ipvs
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"reflect"
@@ -26,14 +28,19 @@ import (
 	"testing"
 	"time"
 
+	p2j "github.com/prometheus/prom2json"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	v1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1beta1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	clientset "k8s.io/client-go/kubernetes"
+	fakeclientset "k8s.io/client-go/kubernetes/fake"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/proxy"
@@ -42,6 +49,7 @@ import (
 	utilproxy "k8s.io/kubernetes/pkg/proxy/util"
 	proxyutiliptables "k8s.io/kubernetes/pkg/proxy/util/iptables"
 	proxyutiltest "k8s.io/kubernetes/pkg/proxy/util/testing"
+	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
 	"k8s.io/kubernetes/pkg/util/async"
 	utilipset "k8s.io/kubernetes/pkg/util/ipset"
 	ipsettest "k8s.io/kubernetes/pkg/util/ipset/testing"
@@ -49,6 +57,7 @@ import (
 	iptablestest "k8s.io/kubernetes/pkg/util/iptables/testing"
 	utilipvs "k8s.io/kubernetes/pkg/util/ipvs"
 	ipvstest "k8s.io/kubernetes/pkg/util/ipvs/testing"
+	v1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
 	"k8s.io/utils/exec"
 	fakeexec "k8s.io/utils/exec/testing"
 	utilpointer "k8s.io/utils/pointer"
@@ -106,6 +115,9 @@ func (fake *fakeIPSetVersioner) GetVersion() (string, error) {
 }
 
 func NewFakeProxier(ipt utiliptables.Interface, ipvs utilipvs.Interface, ipset utilipset.Interface, nodeIPs []net.IP, excludeCIDRs []*net.IPNet, endpointSlicesEnabled bool) *Proxier {
+	var clientSet clientset.Interface
+	clientSet = fakeclientset.NewSimpleClientset()
+
 	fcmd := fakeexec.FakeCmd{
 		CombinedOutputScript: []fakeexec.FakeAction{
 			func() ([]byte, []byte, error) { return []byte("dummy device have been created"), nil, nil },
@@ -125,34 +137,41 @@ func NewFakeProxier(ipt utiliptables.Interface, ipvs utilipvs.Interface, ipset u
 		ipsetList[is.name] = NewIPSet(ipset, is.name, is.setType, false, is.comment)
 	}
 	p := &Proxier{
-		exec:                  fexec,
-		serviceMap:            make(proxy.ServiceMap),
-		serviceChanges:        proxy.NewServiceChangeTracker(newServiceInfo, nil, nil, nil),
-		endpointsMap:          make(proxy.EndpointsMap),
-		endpointsChanges:      proxy.NewEndpointChangeTracker(testHostname, nil, nil, nil, endpointSlicesEnabled, nil),
-		excludeCIDRs:          excludeCIDRs,
-		iptables:              ipt,
-		ipvs:                  ipvs,
-		ipset:                 ipset,
-		strictARP:             false,
-		localDetector:         proxyutiliptables.NewNoOpLocalDetector(),
-		hostname:              testHostname,
-		portsMap:              make(map[utilproxy.LocalPort]utilproxy.Closeable),
-		portMapper:            &fakePortOpener{[]*utilproxy.LocalPort{}},
-		serviceHealthServer:   healthcheck.NewFakeServiceHealthServer(),
-		ipvsScheduler:         DefaultScheduler,
-		ipGetter:              &fakeIPGetter{nodeIPs: nodeIPs},
-		iptablesData:          bytes.NewBuffer(nil),
-		filterChainsData:      bytes.NewBuffer(nil),
-		natChains:             bytes.NewBuffer(nil),
-		natRules:              bytes.NewBuffer(nil),
-		filterChains:          bytes.NewBuffer(nil),
-		filterRules:           bytes.NewBuffer(nil),
-		netlinkHandle:         netlinktest.NewFakeNetlinkHandle(),
-		ipsetList:             ipsetList,
-		nodePortAddresses:     make([]string, 0),
-		networkInterfacer:     proxyutiltest.NewFakeNetwork(),
-		gracefuldeleteManager: NewGracefulTerminationManager(ipvs),
+		exec:                      fexec,
+		serviceMap:                make(proxy.ServiceMap),
+		serviceChanges:            proxy.NewServiceChangeTracker(newServiceInfo, nil, nil, nil),
+		endpointsMap:              make(proxy.EndpointsMap),
+		endpointsChanges:          proxy.NewEndpointChangeTracker(testHostname, nil, nil, nil, endpointSlicesEnabled, nil),
+		excludeCIDRs:              excludeCIDRs,
+		iptables:                  ipt,
+		ipvs:                      ipvs,
+		ipset:                     ipset,
+		strictARP:                 false,
+		localDetector:             proxyutiliptables.NewNoOpLocalDetector(),
+		hostname:                  testHostname,
+		portsMap:                  make(map[utilproxy.LocalPort]utilproxy.Closeable),
+		portMapper:                &fakePortOpener{[]*utilproxy.LocalPort{}},
+		serviceHealthServer:       healthcheck.NewFakeServiceHealthServer(),
+		ipvsScheduler:             DefaultScheduler,
+		ipGetter:                  &fakeIPGetter{nodeIPs: nodeIPs},
+		iptablesData:              bytes.NewBuffer(nil),
+		filterChainsData:          bytes.NewBuffer(nil),
+		natChains:                 bytes.NewBuffer(nil),
+		natRules:                  bytes.NewBuffer(nil),
+		filterChains:              bytes.NewBuffer(nil),
+		filterRules:               bytes.NewBuffer(nil),
+		netlinkHandle:             netlinktest.NewFakeNetlinkHandle(),
+		ipsetList:                 ipsetList,
+		nodePortAddresses:         make([]string, 0),
+		networkInterfacer:         proxyutiltest.NewFakeNetwork(),
+		gracefuldeleteManager:     NewGracefulTerminationManager(ipvs),
+		clientSet:                 clientSet,
+		nodesName:                 []string{},
+		temperatureInfoBelongNode: make(map[string]nodeTemperatureInfo),
+		powerConsumptionCache:     safeCache{cache: make(map[cacheKey]float32)},
+		endpointsBelongNode:       make(map[string]string),
+		getInfo:                   getInfomationsImpl{},
+		nodesScore:                make(map[string]int64),
 	}
 	p.setInitialized(true)
 	p.syncRunner = async.NewBoundedFrequencyRunner("test-sync-runner", p.syncProxyRules, 0, time.Minute, 1)
@@ -206,6 +225,986 @@ func makeTestEndpoints(namespace, name string, eptFunc func(*v1.Endpoints)) *v1.
 	}
 	eptFunc(ept)
 	return ept
+}
+
+// mockGetInformations implements the getInfomations interface for mocking.
+type mockGetInformations struct {
+	mock.Mock
+}
+
+// Mock getNodeMetrics function.
+func (mock *mockGetInformations) getNodeMetrics(ctx context.Context, node string) (*v1beta1.NodeMetrics, error) {
+	results := mock.Called()
+	return results.Get(0).(*v1beta1.NodeMetrics), results.Error(1)
+}
+
+// Mock getFamilyInfo function.
+func (mock *mockGetInformations) getFamilyInfo(url string) []*p2j.Family {
+	results := mock.Called()
+	return results.Get(0).([]*p2j.Family)
+}
+
+// Mock predictPC function.
+func (mock *mockGetInformations) predictPC(values predictInput, nodeInfo *v1.Node) (float32, error) {
+	results := mock.Called()
+	return results.Get(0).(float32), results.Error(1)
+}
+
+// Test for getFamilyInfo
+// Do not normal case tests because it needs a connecting server.
+func TestGetFamilyInfo(t *testing.T) {
+	assert := assert.New(t)
+	t.Run("Abnormal case [GET request executing failed]", func(t *testing.T) {
+		var getInfo getInfomationsImpl
+		result := getInfo.getFamilyInfo("http://255.255.255.255:9290/metrics")
+		assert.Equal(result, []*p2j.Family{})
+	})
+}
+
+// Test for predictPC
+// Do not normal case tests because it needs a connecting server.
+func TestPredictPC(t *testing.T) {
+	assert := assert.New(t)
+	ipt := iptablestest.NewFake()
+	ipvs := ipvstest.NewFake()
+	ipset := ipsettest.NewFake(testIPSetVersion)
+	fp := NewFakeProxier(ipt, ipvs, ipset, nil, nil, false)
+
+	testNodes := struct {
+		node []*v1.Node
+	}{
+		node: []*v1.Node{
+			makeNode("node-1", 30000, 20000, map[string]string{}),
+			makeNode("node-2", 30000, 20000, map[string]string{
+				"tensorflow/host": "255.255.255.255", "tensorflow/name": "test"}),
+			makeNode("node-3", 30000, 20000, map[string]string{
+				"tensorflow/host": "255.255.255.255", "tensorflow/port": "8500", "tensorflow/name": "test", "tensorflow/version": "1", "tensorflow/signature": "test"}),
+		},
+	}
+
+	t.Run("Abnormal case [all label is not defined]", func(t *testing.T) {
+		powerConsumpsion, err := fp.getInfo.predictPC(predictInput{}, testNodes.node[0])
+
+		assert.Equal(powerConsumpsion, float32(-1))
+		assert.EqualError(err, "Label is not defined. [tensorflow/host: false, tensorflow/port: false, tensorflow/name: false]")
+	})
+
+	t.Run("Abnormal case [tensorflow/port label is not defined]", func(t *testing.T) {
+		powerConsumpsion, err := fp.getInfo.predictPC(predictInput{}, testNodes.node[1])
+
+		assert.Equal(powerConsumpsion, float32(-1))
+		assert.EqualError(err, "Label is not defined. [tensorflow/host: true, tensorflow/port: false, tensorflow/name: true]")
+	})
+
+	t.Run("Abnormal case [Cannot connect server]", func(t *testing.T) {
+		powerConsumpsion, err := fp.getInfo.predictPC(predictInput{}, testNodes.node[2])
+
+		assert.Equal(powerConsumpsion, float32(-1))
+		assert.Error(err)
+	})
+}
+
+// Test for calcWeight
+func TestCalcWeight(t *testing.T) {
+	assert := assert.New(t)
+	ipt := iptablestest.NewFake()
+	ipvs := ipvstest.NewFake()
+	ipset := ipsettest.NewFake(testIPSetVersion)
+	fp := NewFakeProxier(ipt, ipvs, ipset, nil, nil, false)
+
+	t.Run("Normal case", func(t *testing.T) {
+		fakeEndpointsBelongNode := map[string]string{
+			"0.0.0.0": "node0",
+			"1.1.1.1": "node1",
+			"2.2.2.2": "node2",
+		}
+		fakeNodesScore := map[string]int64{
+			"node0": 1,
+			"node1": 5,
+			"node2": 10,
+		}
+		fp.endpointsBelongNode = fakeEndpointsBelongNode
+		fp.nodesScore = fakeNodesScore
+
+		result := fp.CalcWeight([]string{"0.0.0.0:80", "1.1.1.1:80", "2.2.2.2:80"})
+		assert.Equal(result, map[string]int{"0.0.0.0:80": 100, "1.1.1.1:80": 20, "2.2.2.2:80": 10})
+	})
+
+	t.Run("Normal case [len of endpointlist is 0]", func(t *testing.T) {
+		result := fp.CalcWeight([]string{})
+		assert.Equal(result, map[string]int{})
+	})
+
+	t.Run("Normal case [len of endpointlist is 1]", func(t *testing.T) {
+		result := fp.CalcWeight([]string{"0.0.0.0:80"})
+		assert.Equal(result, map[string]int{"0.0.0.0:80": 1})
+	})
+
+	t.Run("Normal case [Missing port in address and nodeScore not exits]", func(t *testing.T) {
+		fp.endpointsBelongNode = map[string]string{"0.0.0.0": "node0", "1.1.1.1": "node1", "2.2.2.2": "node2"}
+		fp.nodesScore = map[string]int64{"node0": 10, "node1": 10}
+
+		result := fp.CalcWeight([]string{"0.0.0.0", "1.1.1.1:80", "2.2.2.2:80"})
+		assert.Equal(result, map[string]int{"1.1.1.1:80": 100, "2.2.2.2:80": 0})
+	})
+
+	t.Run("Normal case [Scores of all nodes could not be calculated]", func(t *testing.T) {
+		fp.nodesScore = map[string]int64{}
+
+		result := fp.CalcWeight([]string{"0.0.0.0", "1.1.1.1"})
+		assert.Equal(result, map[string]int{"0.0.0.0": 1, "1.1.1.1": 1})
+	})
+}
+
+func TestGetStandardTemperature(t *testing.T) {
+	assert := assert.New(t)
+	testNodes := struct {
+		node []*v1.Node
+	}{
+		node: []*v1.Node{
+			makeNode("node-test1", 30000, 20000, map[string]string{"ambient/max": "36.5", "ambient/min": "11.5"}),
+			makeNode("node-test2", 30000, 20000, map[string]string{}),
+			makeNode("node-test3", 30000, 20000, map[string]string{"ambient/max": "36.5"}),
+			makeNode("node-test4", 30000, 20000, map[string]string{"ambient/max": "36.5°C", "ambient/min": "11.5"}),
+			makeNode("node-test5", 30000, 20000, map[string]string{"ambient/max": "36.5", "ambient/min": "11.5°C"}),
+			makeNode("node-test6", 30000, 20000, map[string]string{"ambient/max": "25.5", "ambient/min": "25.5"}),
+		},
+	}
+
+	t.Run("Normal case", func(t *testing.T) {
+		nodeInfo := framework.NewNodeInfo()
+		nodeInfo.SetNode(testNodes.node[0])
+		ambMax, ambMin, err := getStandardTemperature(nodeInfo.Node(), labelAmbientMax, labelAmbientMin)
+
+		assert.Nil(err)
+		assert.Equal(ambMax, float32(36.5))
+		assert.Equal(ambMin, float32(11.5))
+	})
+
+	t.Run("Abnormal case [temperature max and temperature min labels are not defined]", func(t *testing.T) {
+		nodeInfo := framework.NewNodeInfo()
+		nodeInfo.SetNode(testNodes.node[1])
+		ambMax, ambMin, err := getStandardTemperature(nodeInfo.Node(), labelAmbientMax, labelAmbientMin)
+
+		assert.EqualError(err, "Standard temperature informations label is not defined")
+		assert.Equal(ambMax, float32(-1))
+		assert.Equal(ambMin, float32(-1))
+	})
+
+	t.Run("Abnormal case [temperature min label is not defined]", func(t *testing.T) {
+		nodeInfo := framework.NewNodeInfo()
+		nodeInfo.SetNode(testNodes.node[2])
+		ambMax, ambMin, err := getStandardTemperature(nodeInfo.Node(), labelAmbientMax, labelAmbientMin)
+
+		assert.EqualError(err, "Standard temperature informations label is not defined")
+		assert.Equal(ambMax, float32(-1))
+		assert.Equal(ambMin, float32(-1))
+	})
+
+	t.Run("Abnormal case [temperature max can't convert to float64.]", func(t *testing.T) {
+		nodeInfo := framework.NewNodeInfo()
+		nodeInfo.SetNode(testNodes.node[3])
+		ambMax, ambMin, err := getStandardTemperature(nodeInfo.Node(), labelAmbientMax, labelAmbientMin)
+
+		assert.EqualError(err, "Convert to float64 failed")
+		assert.Equal(ambMax, float32(-1))
+		assert.Equal(ambMin, float32(-1))
+	})
+
+	t.Run("Abnormal case [temperature min can't convert to float64.]", func(t *testing.T) {
+		nodeInfo := framework.NewNodeInfo()
+		nodeInfo.SetNode(testNodes.node[4])
+		ambMax, ambMin, err := getStandardTemperature(nodeInfo.Node(), labelAmbientMax, labelAmbientMin)
+
+		assert.EqualError(err, "Convert to float64 failed")
+		assert.Equal(ambMax, float32(-1))
+		assert.Equal(ambMin, float32(-1))
+	})
+
+	t.Run("Abnormal case [Occur division by zero.]", func(t *testing.T) {
+		nodeInfo := framework.NewNodeInfo()
+		nodeInfo.SetNode(testNodes.node[5])
+		ambMax, ambMin, err := getStandardTemperature(nodeInfo.Node(), labelAmbientMax, labelAmbientMin)
+
+		assert.EqualError(err, "division by zero")
+		assert.Equal(ambMax, float32(-1))
+		assert.Equal(ambMin, float32(-1))
+	})
+}
+
+func TestGetNodeInternalIP(t *testing.T) {
+	assert := assert.New(t)
+	testNodes := struct {
+		nodes []*v1.Node
+	}{
+		nodes: []*v1.Node{
+			makeNode("node-test1", 30000, 20000, map[string]string{}),
+			makeNode("node-test2", 30000, 20000, map[string]string{}),
+		},
+	}
+
+	t.Run("Normal case", func(t *testing.T) {
+		nodeInfo := framework.NewNodeInfo()
+		nodeInfo.SetNode(testNodes.nodes[0])
+		nodeInfo.Node().Status.Addresses = append(nodeInfo.Node().Status.Addresses, v1.NodeAddress{
+			Type:    v1.NodeInternalIP,
+			Address: "11.11.11.11",
+		})
+		adress, err := getNodeInternalIP(nodeInfo.Node())
+		assert.Nil(err)
+		assert.Equal(adress, "11.11.11.11")
+	})
+
+	t.Run("Abnormal case [Can't get the internal IP of a node.]", func(t *testing.T) {
+		nodeInfo := framework.NewNodeInfo()
+		nodeInfo.SetNode(testNodes.nodes[1])
+		nodeInfo.Node().Status.Addresses = append(nodeInfo.Node().Status.Addresses, v1.NodeAddress{
+			Type:    v1.NodeExternalIP,
+			Address: "22.22.22.22",
+		})
+		adress, err := getNodeInternalIP(nodeInfo.Node())
+		assert.EqualError(err, "Cannot get node internalIP")
+		assert.Empty(adress)
+	})
+}
+
+func TestGetNodeTemperature(t *testing.T) {
+	assert := assert.New(t)
+	ipt := iptablestest.NewFake()
+	ipvs := ipvstest.NewFake()
+	ipset := ipsettest.NewFake(testIPSetVersion)
+	fp := NewFakeProxier(ipt, ipvs, ipset, nil, nil, false)
+
+	t.Run("Normal case", func(t *testing.T) {
+		mockObj := new(mockGetInformations)
+		testData := []*p2j.Family{
+			{
+				Name: "ipmi_temperature_celsius",
+				Metrics: []interface{}{
+					p2j.Metric{
+						Labels:      map[string]string{"id": "1", "name": "Ambient"},
+						TimestampMs: "",
+						Value:       "20",
+					},
+					p2j.Metric{
+						Labels:      map[string]string{"id": "10", "name": "CPU2"},
+						TimestampMs: "",
+						Value:       "56",
+					},
+					p2j.Metric{
+						Labels:      map[string]string{"id": "9", "name": "CPU1"},
+						TimestampMs: "",
+						Value:       "42",
+					},
+					p2j.Metric{
+						Labels:      map[string]string{"id": "99", "name": "testkey"},
+						TimestampMs: "",
+						Value:       "99",
+					},
+				},
+			},
+			{
+				Name: "test_data",
+				Metrics: []interface{}{
+					p2j.Metric{
+						Labels:      map[string]string{},
+						TimestampMs: "",
+						Value:       "13888",
+					},
+				},
+			},
+		}
+		mockObj.On("getFamilyInfo", mock.Anything).Return(testData)
+		fp.getInfo = mockObj
+		result, err := fp.getNodeTemperature("0.0.0.0")
+		assert.Nil(err)
+		assert.Equal(result, []float32{20, 42, 56})
+	})
+
+	t.Run("Abnormal case [Can't convert to float64]", func(t *testing.T) {
+		mockObj := new(mockGetInformations)
+		testData := []*p2j.Family{
+			{
+				Name: "ipmi_temperature_celsius",
+				Metrics: []interface{}{
+					p2j.Metric{
+						Labels:      map[string]string{"id": "1", "name": "Ambient"},
+						TimestampMs: "",
+						Value:       "20",
+					},
+					p2j.Metric{
+						Labels:      map[string]string{"id": "10", "name": "CPU2"},
+						TimestampMs: "",
+						Value:       "56",
+					},
+					p2j.Metric{
+						Labels:      map[string]string{"id": "9", "name": "CPU1"},
+						TimestampMs: "",
+						Value:       "42°C",
+					},
+				},
+			},
+		}
+		mockObj.On("getFamilyInfo", mock.Anything).Return(testData)
+		fp.getInfo = mockObj
+		result, err := fp.getNodeTemperature("0.0.0.0")
+		assert.EqualError(err, "Convert to float64 failed")
+		assert.Nil(result)
+	})
+
+	t.Run("Abnormal case [CPU1 information does not exist]", func(t *testing.T) {
+		mockObj := new(mockGetInformations)
+		testData := []*p2j.Family{
+			{
+				Name: "ipmi_temperature_celsius",
+				Metrics: []interface{}{
+					p2j.Metric{
+						Labels:      map[string]string{"id": "1", "name": "Ambient"},
+						TimestampMs: "",
+						Value:       "20",
+					},
+					p2j.Metric{
+						Labels:      map[string]string{"id": "10", "name": "CPU2"},
+						TimestampMs: "",
+						Value:       "56",
+					},
+				},
+			},
+		}
+		mockObj.On("getFamilyInfo", mock.Anything).Return(testData)
+		fp.getInfo = mockObj
+		result, err := fp.getNodeTemperature("0.0.0.0")
+		assert.EqualError(err, "Cannot get node temperature")
+		assert.Nil(result)
+	})
+
+	t.Run("Abnormal case [ipmi_temperature_celsius key does not exist]", func(t *testing.T) {
+		mockObj := new(mockGetInformations)
+		testData := []*p2j.Family{
+			{
+				Name: "ipmi_temperature_test",
+				Metrics: []interface{}{
+					p2j.Metric{
+						Labels:      map[string]string{"id": "1", "name": "Ambient"},
+						TimestampMs: "",
+						Value:       "20",
+					},
+					p2j.Metric{
+						Labels:      map[string]string{"id": "10", "name": "CPU2"},
+						TimestampMs: "",
+						Value:       "56",
+					},
+					p2j.Metric{
+						Labels:      map[string]string{"id": "9", "name": "CPU1"},
+						TimestampMs: "",
+						Value:       "42",
+					},
+				},
+			},
+		}
+		mockObj.On("getFamilyInfo", mock.Anything).Return(testData)
+		fp.getInfo = mockObj
+		result, err := fp.getNodeTemperature("0.0.0.0")
+		assert.EqualError(err, "ipmi_temperature_celsius is not exits from 0.0.0.0")
+		assert.Nil(result)
+	})
+
+	t.Run("Abnormal case [GetFamilyInfo method return error]", func(t *testing.T) {
+		mockObj := new(mockGetInformations)
+		mockObj.On("getFamilyInfo", mock.Anything).Return([]*p2j.Family{})
+		fp.getInfo = mockObj
+		result, err := fp.getNodeTemperature("0.0.0.0")
+		assert.EqualError(err, "Cannot get FamilyInfo")
+		assert.Nil(result)
+	})
+}
+
+func TestGetNodesName(t *testing.T) {
+	assert := assert.New(t)
+	ipt := iptablestest.NewFake()
+	ipvs := ipvstest.NewFake()
+	ipset := ipsettest.NewFake(testIPSetVersion)
+	fp := NewFakeProxier(ipt, ipvs, ipset, nil, nil, false)
+
+	testNodes := struct {
+		node []*v1.Node
+	}{
+		node: []*v1.Node{
+			makeNode("node-test1", 30000, 20000, map[string]string{}),
+			makeNode("node-test2", 30000, 20000, map[string]string{}),
+		},
+	}
+
+	t.Run("Normal case [Node status is Ready]", func(t *testing.T) {
+		fakeNode := testNodes.node[0]
+		fakeCondition := v1.NodeCondition{
+			Type:   v1.NodeReady,
+			Status: v1.ConditionTrue,
+		}
+		fakeNode.Status.Conditions = []v1.NodeCondition{fakeCondition}
+		fakeNode2 := testNodes.node[1]
+		fakeNode2.Status.Conditions = []v1.NodeCondition{fakeCondition}
+
+		clientSet := fakeclientset.NewSimpleClientset(fakeNode, fakeNode2)
+		fp.clientSet = clientSet
+		fp.getNodesName()
+		assert.Equal(fp.nodesName, []string{"node-test1", "node-test2"})
+	})
+
+	t.Run("Normal case [Node status is NotReady]", func(t *testing.T) {
+		fakeNode := testNodes.node[0]
+		fakeCondition := v1.NodeCondition{
+			Type:   v1.NodeReady,
+			Status: v1.ConditionFalse,
+		}
+		fakeNode.Status.Conditions = []v1.NodeCondition{fakeCondition}
+
+		clientSet := fakeclientset.NewSimpleClientset(fakeNode)
+		fp.clientSet = clientSet
+		fp.getNodesName()
+		assert.Equal(fp.nodesName, []string{})
+	})
+}
+
+func TestGetPodsEndpoint(t *testing.T) {
+	assert := assert.New(t)
+	ipt := iptablestest.NewFake()
+	ipvs := ipvstest.NewFake()
+	ipset := ipsettest.NewFake(testIPSetVersion)
+	fp := NewFakeProxier(ipt, ipvs, ipset, nil, nil, false)
+
+	testPods := struct {
+		pods []*v1.Pod
+	}{
+		pods: []*v1.Pod{
+			makePod("node-test1", "pod-test1", "1000m", "1000m"),
+			makePod("node-test2", "pod-test2", "1000m", "1000m"),
+		},
+	}
+
+	t.Run("Normal case [Pod status is Running]", func(t *testing.T) {
+		fakePod := testPods.pods[0]
+		fakePod.Status.Phase = v1.PodRunning
+		fakePod.Status.PodIP = "0.0.0.0"
+
+		fakePod2 := testPods.pods[1]
+		fakePod2.Status.Phase = v1.PodRunning
+		fakePod2.Status.PodIP = "1.1.1.1"
+
+		clientSet := fakeclientset.NewSimpleClientset(fakePod, fakePod2)
+		fp.clientSet = clientSet
+		fp.getPodsEndpoint()
+		assert.Equal(fp.endpointsBelongNode, map[string]string{"0.0.0.0": "node-test1", "1.1.1.1": "node-test2"})
+	})
+
+	t.Run("Normal case [Pod status is Pending]", func(t *testing.T) {
+		fakePod := testPods.pods[0]
+		fakePod.Status.Phase = v1.PodPending
+
+		clientSet := fakeclientset.NewSimpleClientset(fakePod)
+		fp.clientSet = clientSet
+		fp.getPodsEndpoint()
+		assert.Equal(fp.endpointsBelongNode, map[string]string{})
+	})
+}
+
+func TestCalcCPUUsage(t *testing.T) {
+	assert := assert.New(t)
+	ipt := iptablestest.NewFake()
+	ipvs := ipvstest.NewFake()
+	ipset := ipsettest.NewFake(testIPSetVersion)
+	fp := NewFakeProxier(ipt, ipvs, ipset, nil, nil, false)
+
+	testNodes := struct {
+		nodes []*v1.Node
+	}{
+		nodes: []*v1.Node{
+			makeNode("node-test1", 30000, 20000, map[string]string{}),
+		},
+	}
+
+	t.Run("Normal case", func(t *testing.T) {
+		mockObj := new(mockGetInformations)
+		nodeMetrics := &v1beta1.NodeMetrics{
+			Usage: v1.ResourceList{
+				v1.ResourceCPU: *resource.NewMilliQuantity(
+					5000,
+					resource.DecimalSI,
+				),
+			},
+		}
+
+		mockObj.On("getNodeMetrics", mock.Anything).Return(nodeMetrics, nil)
+
+		fp.getInfo = mockObj
+		fp.nodesName = []string{"node-test1"}
+		beforeUsage, calcCPUUsageErr := fp.calcCPUUsage(testNodes.nodes[0])
+
+		assert.Nil(calcCPUUsageErr)
+		assert.Equal(beforeUsage, float32(0.16666667))
+	})
+
+	t.Run("Abnormal case [GetNodeMetrics error]", func(t *testing.T) {
+		mockObj := new(mockGetInformations)
+		nodeMetrics := &v1beta1.NodeMetrics{}
+		mockObj.On("getNodeMetrics", mock.Anything).Return(nodeMetrics, errors.New("error1"))
+
+		fp.getInfo = mockObj
+		beforeUsage, calcCPUUsageErr := fp.calcCPUUsage(testNodes.nodes[0])
+
+		assert.EqualError(calcCPUUsageErr, "error1")
+		assert.Equal(beforeUsage, float32(-1))
+	})
+}
+
+func TestCalcNormalizeTemperature(t *testing.T) {
+	assert := assert.New(t)
+	ipt := iptablestest.NewFake()
+	ipvs := ipvstest.NewFake()
+	ipset := ipsettest.NewFake(testIPSetVersion)
+	fp := NewFakeProxier(ipt, ipvs, ipset, nil, nil, false)
+
+	testNodes := struct {
+		node []*v1.Node
+	}{
+		node: []*v1.Node{
+			makeNode("node-test1", 30000, 20000, map[string]string{"ambient/max": "36.5", "ambient/min": "11.5", "cpu1/max": "42", "cpu1/min": "24", "cpu2/max": "49", "cpu2/min": "23"}),
+			makeNode("node-test2", 30000, 20000, map[string]string{"ambient/max": "36.5", "ambient/min": "11.5", "cpu1/max": "29", "cpu1/min": "24", "cpu2/max": "38", "cpu2/min": "23"}),
+			makeNode("node-test3", 30000, 20000, map[string]string{}),
+			makeNode("node-test4", 30000, 20000, map[string]string{"ambient/max": "36.5", "ambient/min": "11.5", "cpu2/max": "49", "cpu2/min": "23"}),
+			makeNode("node-test5", 30000, 20000, map[string]string{"ambient/max": "36.5", "ambient/min": "11.5", "cpu1/max": "42", "cpu1/min": "24"}),
+		},
+	}
+
+	testNodes.node[0].Status.Addresses = append(testNodes.node[0].Status.Addresses, v1.NodeAddress{
+		Type:    v1.NodeInternalIP,
+		Address: "99.99.99.99",
+	})
+
+	t.Run("Normal case [Get information from GetNodeTemperature]", func(t *testing.T) {
+		mockObj := new(mockGetInformations)
+		testData := []*p2j.Family{
+			{
+				Name: "ipmi_temperature_celsius",
+				Metrics: []interface{}{
+					p2j.Metric{
+						Labels:      map[string]string{"id": "1", "name": "Ambient"},
+						TimestampMs: "",
+						Value:       "24",
+					},
+					p2j.Metric{
+						Labels:      map[string]string{"id": "10", "name": "CPU2"},
+						TimestampMs: "",
+						Value:       "36",
+					},
+					p2j.Metric{
+						Labels:      map[string]string{"id": "9", "name": "CPU1"},
+						TimestampMs: "",
+						Value:       "33",
+					},
+				},
+			},
+		}
+		mockObj.On("getFamilyInfo", mock.Anything).Return(testData)
+
+		fp.getInfo = mockObj
+		amb, cpu1, cpu2, err := fp.calcNormalizeTemperature(testNodes.node[0])
+
+		assert.Nil(err)
+		assert.Equal(amb, float32(0.5))
+		assert.Equal(cpu1, float32(0.5))
+		assert.Equal(cpu2, float32(0.5))
+	})
+
+	fakeNodeTemperatureInfo := nodeTemperatureInfo{
+		ambient: 20.5,
+		cpu1:    28.5,
+		cpu2:    29.5,
+	}
+	fp.temperatureInfoBelongNode[testNodes.node[0].Name] = fakeNodeTemperatureInfo
+	t.Run("Normal case [GetNodeTemperature error, but use temperatureInfoBelongNode[nodeName] information]", func(t *testing.T) {
+		mockObj := new(mockGetInformations)
+		mockObj.On("getFamilyInfo", mock.Anything).Return([]*p2j.Family{})
+
+		fp.getInfo = mockObj
+		amb, cpu1, cpu2, err := fp.calcNormalizeTemperature(testNodes.node[0])
+
+		assert.Nil(err)
+		assert.Equal(amb, float32(0.36))
+		assert.Equal(cpu1, float32(0.25))
+		assert.Equal(cpu2, float32(0.25))
+	})
+
+	fakeNodeTemperatureInfo = nodeTemperatureInfo{
+		ambient:          22.5,
+		cpu1:             30.0,
+		cpu2:             32.5,
+		ambientTimestamp: time.Now(),
+	}
+	fp.temperatureInfoBelongNode[testNodes.node[0].Name] = fakeNodeTemperatureInfo
+	t.Run("Normal case [Use temperatureInfoBelongNode[nodeName] information]", func(t *testing.T) {
+		fp.getInfo = getInfomationsImpl{}
+		amb, cpu1, cpu2, err := fp.calcNormalizeTemperature(testNodes.node[0])
+
+		assert.Nil(err)
+		assert.Equal(amb, float32(0.44))
+		assert.Equal(cpu1, float32(0.33333334))
+		assert.Equal(cpu2, float32(0.3653846))
+	})
+
+	fakeNodeTemperatureInfo = nodeTemperatureInfo{
+		ambient: 18.5,
+		cpu1:    26.5,
+		cpu2:    30.5,
+	}
+	fp.temperatureInfoBelongNode[testNodes.node[1].Name] = fakeNodeTemperatureInfo
+	t.Run("Normal case [Cannot get node internal IP]", func(t *testing.T) {
+		fp.getInfo = getInfomationsImpl{}
+		amb, cpu1, cpu2, err := fp.calcNormalizeTemperature(testNodes.node[1])
+
+		assert.Nil(err)
+		assert.Equal(amb, float32(0.28))
+		assert.Equal(cpu1, float32(0.5))
+		assert.Equal(cpu2, float32(0.5))
+	})
+
+	fp.temperatureInfoBelongNode[testNodes.node[0].Name] = nodeTemperatureInfo{}
+	t.Run("Abnormal case [GetNodeTemperature error and temperatureInfoBelongNode[nodeName] information is nil]", func(t *testing.T) {
+		mockObj := new(mockGetInformations)
+		mockObj.On("getFamilyInfo", mock.Anything).Return([]*p2j.Family{})
+
+		fp.getInfo = mockObj
+		amb, cpu1, cpu2, err := fp.calcNormalizeTemperature(testNodes.node[0])
+
+		assert.EqualError(err, "not exist ipmi data")
+		assert.Equal(amb, float32(-1))
+		assert.Equal(cpu1, float32(-1))
+		assert.Equal(cpu2, float32(-1))
+	})
+
+	fp.temperatureInfoBelongNode[testNodes.node[0].Name] = nodeTemperatureInfo{ambientTimestamp: time.Now()}
+	t.Run("Abnormal case [Try to use information from temperatureInfoBelongNode[nodeName], but it is nil", func(t *testing.T) {
+		fp.getInfo = getInfomationsImpl{}
+		amb, cpu1, cpu2, err := fp.calcNormalizeTemperature(testNodes.node[0])
+
+		assert.EqualError(err, "not exist ipmi data")
+		assert.Equal(amb, float32(-1))
+		assert.Equal(cpu1, float32(-1))
+		assert.Equal(cpu2, float32(-1))
+	})
+
+	t.Run("Abnormal case [ambient/max and ambient/min labels are not defined]", func(t *testing.T) {
+		fp.getInfo = getInfomationsImpl{}
+		amb, cpu1, cpu2, err := fp.calcNormalizeTemperature(testNodes.node[2])
+
+		assert.EqualError(err, "Standard temperature informations label is not defined")
+		assert.Equal(amb, float32(-1))
+		assert.Equal(cpu1, float32(-1))
+		assert.Equal(cpu2, float32(-1))
+	})
+
+	t.Run("Abnormal case [cpu1/max and cpu1/min labels are not defined]", func(t *testing.T) {
+		fp.getInfo = getInfomationsImpl{}
+		amb, cpu1, cpu2, err := fp.calcNormalizeTemperature(testNodes.node[3])
+
+		assert.EqualError(err, "Standard temperature informations label is not defined")
+		assert.Equal(amb, float32(-1))
+		assert.Equal(cpu1, float32(-1))
+		assert.Equal(cpu2, float32(-1))
+	})
+
+	t.Run("Abnormal case [cpu2/max and cpu2/min labels are not defined]", func(t *testing.T) {
+		fp.getInfo = getInfomationsImpl{}
+		amb, cpu1, cpu2, err := fp.calcNormalizeTemperature(testNodes.node[4])
+
+		assert.EqualError(err, "Standard temperature informations label is not defined")
+		assert.Equal(amb, float32(-1))
+		assert.Equal(cpu1, float32(-1))
+		assert.Equal(cpu2, float32(-1))
+	})
+}
+
+func TestScore(t *testing.T) {
+	assert := assert.New(t)
+	ipt := iptablestest.NewFake()
+	ipvs := ipvstest.NewFake()
+	ipset := ipsettest.NewFake(testIPSetVersion)
+	fp := NewFakeProxier(ipt, ipvs, ipset, nil, nil, false)
+	testNodes := struct {
+		nodes []*v1.Node
+	}{
+		nodes: []*v1.Node{
+			makeNode("node-test1", 30000, 20000, map[string]string{"ambient/max": "36.5", "ambient/min": "11.5", "cpu1/max": "42", "cpu1/min": "24", "cpu2/max": "49", "cpu2/min": "23"}),
+			makeNode("node-test2", 30000, 20000, map[string]string{"ambient/max": "36.5", "ambient/min": "11.5"}),
+			makeNode("node-test3", 30000, 20000, map[string]string{}),
+		},
+	}
+	testNodeMetrics := &v1beta1.NodeMetrics{
+		Usage: v1.ResourceList{
+			v1.ResourceCPU: *resource.NewMilliQuantity(
+				7000,
+				resource.DecimalSI,
+			),
+		},
+	}
+	testFamilyData := []*p2j.Family{
+		{
+			Name: "ipmi_temperature_celsius",
+			Metrics: []interface{}{
+				p2j.Metric{
+					Labels:      map[string]string{"id": "1", "name": "Ambient"},
+					TimestampMs: "",
+					Value:       "24",
+				},
+				p2j.Metric{
+					Labels:      map[string]string{"id": "10", "name": "CPU2"},
+					TimestampMs: "",
+					Value:       "36",
+				},
+				p2j.Metric{
+					Labels:      map[string]string{"id": "9", "name": "CPU1"},
+					TimestampMs: "",
+					Value:       "33",
+				},
+			},
+		},
+	}
+
+	testNodes.nodes[0].Status.Addresses = append(testNodes.nodes[0].Status.Addresses, v1.NodeAddress{
+		Type:    v1.NodeInternalIP,
+		Address: "22.22.22.22",
+	})
+
+	t.Run("Normal case", func(t *testing.T) {
+		fakeNode := testNodes.nodes[0]
+		fakeCondition := v1.NodeCondition{
+			Type:   v1.NodeReady,
+			Status: v1.ConditionTrue,
+		}
+		fakeNode.Status.Conditions = []v1.NodeCondition{fakeCondition}
+		mockObj := new(mockGetInformations)
+		mockObj.On("getNodeMetrics", mock.Anything).Return(testNodeMetrics, nil)
+		mockObj.On("getFamilyInfo", mock.Anything).Return(testFamilyData)
+		mockObj.On("predictPC", mock.Anything).Return(float32(106.89), nil)
+		fp.getInfo = mockObj
+		fp.clientSet = fakeclientset.NewSimpleClientset(fakeNode)
+
+		result := fp.Score(testNodes.nodes[0].Name)
+
+		assert.Equal(result, int64(106))
+		preInputKey := predictInput{
+			cpuUsage:    float32(0.2),
+			ambientTemp: float32(0.5),
+			cpu1Temp:    float32(0.5),
+			cpu2Temp:    float32(0.5),
+		}
+		value, ok := fp.powerConsumptionCache.getPCCache(preInputKey, testNodes.nodes[0].Name)
+		assert.Equal(ok, true)
+		assert.Equal(value, float32(106.89))
+	})
+
+	t.Run("Abnormal case [Can't get NodeInfo]", func(t *testing.T) {
+		nodeName := "test-node"
+		fp.clientSet = fakeclientset.NewSimpleClientset()
+		result := fp.Score(nodeName)
+		assert.Equal(result, int64(-1))
+	})
+
+	t.Run("Abnormal case [Can't get NodeMetrics]", func(t *testing.T) {
+		mockObj := new(mockGetInformations)
+		nodeMetrics := &v1beta1.NodeMetrics{}
+		mockObj.On("getNodeMetrics", mock.Anything).Return(nodeMetrics, errors.New("Cannot get NodeMetrics info"))
+		fp.getInfo = mockObj
+		fp.clientSet = fakeclientset.NewSimpleClientset(testNodes.nodes[0])
+
+		result := fp.Score(testNodes.nodes[0].Name)
+		assert.Equal(result, int64(-1))
+	})
+
+	t.Run("Abnormal case [ambient/max and ambient/min labels are not defined]", func(t *testing.T) {
+		mockObj := new(mockGetInformations)
+		mockObj.On("getNodeMetrics", mock.Anything).Return(testNodeMetrics, nil)
+		fp.getInfo = mockObj
+		fp.clientSet = fakeclientset.NewSimpleClientset(testNodes.nodes[2])
+
+		result := fp.Score(testNodes.nodes[2].Name)
+		assert.Equal(result, int64(-1))
+	})
+}
+
+func TestCalcScore(t *testing.T) {
+	assert := assert.New(t)
+	ipt := iptablestest.NewFake()
+	ipvs := ipvstest.NewFake()
+	ipset := ipsettest.NewFake(testIPSetVersion)
+	fp := NewFakeProxier(ipt, ipvs, ipset, nil, nil, false)
+
+	testNodes := struct {
+		node []*v1.Node
+	}{
+		node: []*v1.Node{makeNode("node-1", 30000, 20000, map[string]string{})},
+	}
+
+	t.Run("Normal case [predictPC is success]", func(t *testing.T) {
+		mockObj := new(mockGetInformations)
+		mockObj.On("predictPC", mock.Anything).Return(float32(106.89), nil)
+
+		fp.getInfo = mockObj
+		score := fp.calcScore(testNodes.node[0], predictInput{0.1, 0.4, 0.8, 1.1})
+		_, ok := fp.powerConsumptionCache.getPCCache(predictInput{0.1, 0.4, 0.8, 1.1}, testNodes.node[0].Name)
+		assert.Equal(score, int64(106))
+		assert.Equal(ok, true)
+	})
+
+	t.Run("Normal case [Use consumption power from the cache]", func(t *testing.T) {
+		fp.getInfo = getInfomationsImpl{}
+		score := fp.calcScore(testNodes.node[0], predictInput{0.1, 0.4, 0.8, 1.1})
+
+		assert.Equal(score, int64(106))
+	})
+
+	t.Run("Abnormal case [predictPC is error]", func(t *testing.T) {
+		mockObj := new(mockGetInformations)
+		mockObj.On("predictPC", mock.Anything).Return(float32(-1), errors.New("error"))
+
+		fp.getInfo = mockObj
+		score := fp.calcScore(testNodes.node[0], predictInput{0.4, 0.4, 0.8, 1.1})
+		_, ok := fp.powerConsumptionCache.getPCCache(predictInput{0.4, 0.4, 0.8, 1.1}, testNodes.node[0].Name)
+
+		assert.Equal(score, int64(-1))
+		assert.Equal(ok, false)
+	})
+}
+
+func TestSyncProxyRules(t *testing.T) {
+	assert := assert.New(t)
+	ipt := iptablestest.NewFake()
+	ipvs := ipvstest.NewFake()
+	ipset := ipsettest.NewFake(testIPSetVersion)
+	fp := NewFakeProxier(ipt, ipvs, ipset, nil, nil, false)
+
+	testNodes := struct {
+		pod  []*v1.Pod
+		node []*v1.Node
+	}{
+		pod: []*v1.Pod{makePod("node-test1", "pod-test1", "1000m", "1000m")},
+		node: []*v1.Node{
+			makeNode("node-test1", 30000, 20000, map[string]string{"ambient/max": "36.5", "ambient/min": "11.5", "cpu1/max": "42", "cpu1/min": "24", "cpu2/max": "49", "cpu2/min": "23"}),
+			makeNode("node-test2", 30000, 20000, map[string]string{"ambient/max": "36.5", "ambient/min": "11.5", "cpu1/max": "42", "cpu1/min": "24", "cpu2/max": "49", "cpu2/min": "23"}),
+		},
+	}
+
+	testNodes.node[0].Status.Addresses = append(testNodes.node[0].Status.Addresses, v1.NodeAddress{
+		Type:    v1.NodeInternalIP,
+		Address: "99.99.99.99",
+	})
+
+	t.Run("Abnormal case", func(t *testing.T) {
+		fakePod := testNodes.pod[0]
+		fakePod.Namespace = "test-namespace"
+		fakePod.Status.Phase = v1.PodRunning
+		fakePod.Status.PodIP = "0.0.0.0"
+
+		fakeNode := testNodes.node[0]
+		fakeCondition := v1.NodeCondition{
+			Type:   v1.NodeReady,
+			Status: v1.ConditionTrue,
+		}
+		fakeNode.Status.Conditions = []v1.NodeCondition{fakeCondition}
+		fp.clientSet = fakeclientset.NewSimpleClientset(fakeNode, fakePod)
+
+		mockObj := new(mockGetInformations)
+		nodeMetrics := &v1beta1.NodeMetrics{
+			Usage: v1.ResourceList{
+				v1.ResourceCPU: *resource.NewMilliQuantity(
+					5000,
+					resource.DecimalSI,
+				),
+			},
+		}
+
+		testData := []*p2j.Family{
+			{
+				Name: "ipmi_temperature_celsius",
+				Metrics: []interface{}{
+					p2j.Metric{
+						Labels:      map[string]string{"id": "1", "name": "Ambient"},
+						TimestampMs: "",
+						Value:       "24",
+					},
+					p2j.Metric{
+						Labels:      map[string]string{"id": "10", "name": "CPU2"},
+						TimestampMs: "",
+						Value:       "36",
+					},
+					p2j.Metric{
+						Labels:      map[string]string{"id": "9", "name": "CPU1"},
+						TimestampMs: "",
+						Value:       "33",
+					},
+				},
+			},
+		}
+
+		mockObj.On("getNodeMetrics", mock.Anything).Return(nodeMetrics, nil)
+		mockObj.On("getFamilyInfo", mock.Anything).Return(testData)
+		mockObj.On("predictPC", mock.Anything).Return(float32(86.89), nil)
+		fp.getInfo = mockObj
+		fp.syncProxyRules()
+		assert.Equal(fp.nodesScore[fakeNode.Name], int64(86))
+	})
+
+	t.Run("Abnormal case", func(t *testing.T) {
+		fakePod := testNodes.pod[0]
+		fakePod.Namespace = "test-namespace"
+		fakePod.Status.Phase = v1.PodRunning
+		fakePod.Status.PodIP = "0.0.0.0"
+
+		fakeNode := testNodes.node[0]
+		fakeCondition := v1.NodeCondition{
+			Type:   v1.NodeReady,
+			Status: v1.ConditionTrue,
+		}
+		fakeNode.Status.Conditions = []v1.NodeCondition{fakeCondition}
+		fp.clientSet = fakeclientset.NewSimpleClientset(fakeNode, fakePod)
+
+		fp.getInfo = getInfomationsImpl{}
+		fp.nodesScore = map[string]int64{}
+		fp.syncProxyRules()
+		assert.Equal(fp.nodesScore[fakeNode.Name], int64(-1))
+	})
+
+	t.Run("Abnormal case", func(t *testing.T) {
+		fakePod := testNodes.pod[0]
+		fakePod.Namespace = "test-namespace"
+		fakePod.Status.Phase = v1.PodRunning
+		fakePod.Status.PodIP = "0.0.0.0"
+
+		fakeNode := testNodes.node[0]
+		fakeCondition := v1.NodeCondition{
+			Type:   v1.NodeReady,
+			Status: v1.ConditionTrue,
+		}
+		fakeNode.Status.Conditions = []v1.NodeCondition{fakeCondition}
+		fp.clientSet = fakeclientset.NewSimpleClientset(fakeNode, fakePod)
+
+		mockObj := new(mockGetInformations)
+		nodeMetrics := &v1beta1.NodeMetrics{
+			Usage: v1.ResourceList{
+				v1.ResourceCPU: *resource.NewMilliQuantity(
+					5000,
+					resource.DecimalSI,
+				),
+			},
+		}
+		mockObj.On("getNodeMetrics", mock.Anything).Return(nodeMetrics, nil)
+		mockObj.On("getFamilyInfo", mock.Anything).Return([]*p2j.Family{})
+		fp.getInfo = mockObj
+		fp.nodesScore = map[string]int64{}
+		fp.temperatureInfoBelongNode = map[string]nodeTemperatureInfo{}
+		fp.syncProxyRules()
+		assert.Equal(fp.nodesScore[fakeNode.Name], int64(-1))
+	})
 }
 
 func TestCleanupLeftovers(t *testing.T) {
