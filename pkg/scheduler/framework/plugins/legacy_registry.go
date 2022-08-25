@@ -38,6 +38,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/volumebinding"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/volumerestrictions"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/volumezone"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/minimizepower"
 )
 
 const (
@@ -58,6 +59,9 @@ const (
 	// LeastRequestedPriority defines the name of prioritizer function that prioritize nodes by least
 	// requested utilization.
 	LeastRequestedPriority = "LeastRequestedPriority"
+
+	MinimizePowerName = "MinimizePowerName"
+
 	// BalancedResourceAllocation defines the name of prioritizer function that prioritizes nodes
 	// to help achieve balanced resource usage.
 	BalancedResourceAllocation = "BalancedResourceAllocation"
@@ -201,15 +205,16 @@ func NewLegacyRegistry() *LegacyRegistry {
 
 		// Used as the default set of predicates if Policy was specified, but priorities was nil.
 		DefaultPriorities: map[string]int64{
-			SelectorSpreadPriority:      1,
-			InterPodAffinityPriority:    1,
-			LeastRequestedPriority:      1,
-			BalancedResourceAllocation:  1,
-			NodePreferAvoidPodsPriority: 10000,
-			NodeAffinityPriority:        1,
-			TaintTolerationPriority:     1,
-			ImageLocalityPriority:       1,
-			EvenPodsSpreadPriority:      2,
+			SelectorSpreadPriority:      0,
+			InterPodAffinityPriority:    0,
+			LeastRequestedPriority:      0,
+			BalancedResourceAllocation:  0,
+			MinimizePowerName:           100,
+			NodePreferAvoidPodsPriority: 1000000,
+			NodeAffinityPriority:        0,
+			TaintTolerationPriority:     0,
+			ImageLocalityPriority:       0,
+			EvenPodsSpreadPriority:      0,
 		},
 
 		PredicateToConfigProducer: make(map[string]ConfigProducer),
@@ -388,6 +393,11 @@ func NewLegacyRegistry() *LegacyRegistry {
 	registry.registerPriorityConfigProducer(BalancedResourceAllocation,
 		func(args ConfigProducerArgs) (plugins config.Plugins, pluginConfig []config.PluginConfig) {
 			plugins.Score = appendToPluginSet(plugins.Score, noderesources.BalancedAllocationName, &args.Weight)
+			return
+		})
+	registry.registerPriorityConfigProducer(MinimizePowerName,
+		func(args ConfigProducerArgs) (plugins config.Plugins, pluginConfig []config.PluginConfig) {
+			plugins.Score = appendToPluginSet(plugins.Score, minimizepower.MinimizePowerName, &args.Weight)
 			return
 		})
 	registry.registerPriorityConfigProducer(LeastRequestedPriority,

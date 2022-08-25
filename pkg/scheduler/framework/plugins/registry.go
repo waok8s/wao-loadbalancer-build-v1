@@ -38,6 +38,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/volumerestrictions"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/volumezone"
 	"k8s.io/kubernetes/pkg/scheduler/framework/runtime"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/minimizepower"
 )
 
 // NewInTreeRegistry builds the registry with all the in-tree plugins.
@@ -58,6 +59,7 @@ func NewInTreeRegistry() runtime.Registry {
 		noderesources.BalancedAllocationName:       noderesources.NewBalancedAllocation,
 		noderesources.MostAllocatedName:            noderesources.NewMostAllocated,
 		noderesources.LeastAllocatedName:           noderesources.NewLeastAllocated,
+		minimizepower.MinimizePowerName:            minimizepower.New,
 		noderesources.RequestedToCapacityRatioName: noderesources.NewRequestedToCapacityRatio,
 		volumebinding.Name:                         volumebinding.New,
 		volumerestrictions.Name:                    volumerestrictions.New,
