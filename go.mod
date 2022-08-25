@@ -8,6 +8,16 @@ module k8s.io/kubernetes
 
 go 1.15
 
+replace (
+	tensorflow => ./pkg/tensorflow
+	tensorflow_serving => ./pkg/tensorflow_serving
+)
+
+require (
+	tensorflow v0.0.0-00010101000000-000000000000
+	tensorflow_serving v0.0.0-00010101000000-000000000000
+)
+
 require (
 	bitbucket.org/bertimus9/systemstat v0.0.0-20180207000608-0eeff89b0690
 	github.com/Azure/azure-sdk-for-go v43.0.0+incompatible
@@ -53,6 +63,7 @@ require (
 	github.com/gogo/protobuf v1.3.1
 	github.com/golang/groupcache v0.0.0-20191227052852-215e87163ea7
 	github.com/golang/mock v1.3.1
+	github.com/golang/protobuf v1.5.2
 	github.com/google/cadvisor v0.37.3
 	github.com/google/go-cmp v0.4.0
 	github.com/google/gofuzz v1.1.0
@@ -83,7 +94,8 @@ require (
 	github.com/pmezard/go-difflib v1.0.0
 	github.com/prometheus/client_golang v1.7.1
 	github.com/prometheus/client_model v0.2.0
-	github.com/prometheus/common v0.10.0
+	github.com/prometheus/common v0.33.0
+	github.com/prometheus/prom2json v1.3.1
 	github.com/quobyte/api v0.1.2
 	github.com/robfig/cron v1.1.0
 	github.com/spf13/afero v1.2.2
@@ -101,13 +113,13 @@ require (
 	golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9
 	golang.org/x/net v0.0.0-20201110031124-69a78807bb2b
 	golang.org/x/oauth2 v0.0.0-20191202225959-858c2ad4c8b6
-	golang.org/x/sys v0.0.0-20201112073958-5cba982894dd
+	golang.org/x/sys v0.0.0-20210119212857-b64e53b001e4
 	golang.org/x/time v0.0.0-20191024005414-555d28b269f0
 	golang.org/x/tools v0.0.0-20200616133436-c1934b75d054
 	gonum.org/v1/gonum v0.6.2
 	gonum.org/v1/netlib v0.0.0-20190331212654-76723241ea4e // indirect
 	google.golang.org/api v0.15.1
-	google.golang.org/grpc v1.27.0
+	google.golang.org/grpc v1.48.0
 	gopkg.in/gcfg.v1 v1.2.0
 	gopkg.in/square/go-jose.v2 v2.2.2
 	gopkg.in/yaml.v2 v2.2.8
