@@ -18,6 +18,7 @@ package ipvs
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -43,7 +44,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/workqueue"
 	utilsysctl "k8s.io/component-helpers/node/util/sysctl"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/proxy"
@@ -287,6 +291,15 @@ type Proxier struct {
 	// sets.String is used here since we end up calculating endpoint topology multiple times for the same Service
 	// if it has multiple ports but each Service should only be counted once.
 	serviceNoLocalEndpointsExternal sets.String
+
+	// WAO
+	clientSet                 *kubernetes.Clientset
+	nodesName                 []string
+	temperatureInfoBelongNode map[string]nodeTemperatureInfo
+	powerConsumptionCache     safeCache
+	endpointsBelongNode       map[string]string
+	getInfo                   getInfomations
+	nodesScore                map[string]int64
 }
 
 // IPGetter helps get node network interface IP and IPs binded to the IPVS dummy interface
@@ -462,6 +475,18 @@ func NewProxier(ipt utiliptables.Interface,
 	// excludeCIDRs has been validated before, here we just parse it to IPNet list
 	parsedExcludeCIDRs, _ := netutils.ParseCIDRs(excludeCIDRs)
 
+	// WAO: set clientSet for client-go
+	var clientSet *kubernetes.Clientset
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		klog.Warningf("Cannot get InClusterConfig. Error : %v", err)
+	} else {
+		clientSet, err = kubernetes.NewForConfig(config)
+		if err != nil {
+			klog.Warningf("Cannot create new clientSet. Error : %v", err)
+		}
+	}
+
 	proxier := &Proxier{
 		ipFamily:              ipFamily,
 		serviceMap:            make(proxy.ServiceMap),
@@ -495,6 +520,14 @@ func NewProxier(ipt utiliptables.Interface,
 		nodePortAddresses:     nodePortAddresses,
 		networkInterfacer:     utilproxy.RealNetwork{},
 		gracefuldeleteManager: NewGracefulTerminationManager(ipvs),
+		// WAO
+		clientSet:                 clientSet,
+		nodesName:                 []string{},
+		temperatureInfoBelongNode: make(map[string]nodeTemperatureInfo),
+		powerConsumptionCache:     safeCache{cache: make(map[cacheKey]float32)},
+		endpointsBelongNode:       make(map[string]string),
+		getInfo:                   getInfomationsImpl{},
+		nodesScore:                make(map[string]int64),
 	}
 	// initialize ipsetList with all sets we needed
 	proxier.ipsetList = make(map[string]*IPSet)
@@ -1017,6 +1050,12 @@ func (proxier *Proxier) syncProxyRules() {
 		klog.V(4).InfoS("syncProxyRules complete", "elapsed", time.Since(start))
 	}()
 
+	// WAO: get node name list and pod endpoint list
+	proxier.getNodesName()
+	klog.V(4).Infof("List of nodes Name : %v", proxier.nodesName)
+	proxier.getPodsEndpoint()
+	klog.V(4).Infof("List of pods Endpoint : %v", proxier.endpointsBelongNode)
+
 	// We assume that if this was called, we really want to sync them,
 	// even if nothing changed in the meantime. In other words, callers are
 	// responsible for detecting no-op changes and not calling this function.
@@ -1135,6 +1174,13 @@ func (proxier *Proxier) syncProxyRules() {
 	}
 	// reset slice to filtered entries
 	nodeIPs = nodeIPs[:idx]
+
+	// WAO: calc node score
+	piece := len(proxier.nodesName)
+	workqueue.ParallelizeUntil(context.TODO(), parallelism, piece, func(piece int) {
+		proxier.nodesScore[proxier.nodesName[piece]] = int64(proxier.Score(proxier.nodesName[piece]))
+	}, chunkSizeFor(piece))
+	klog.V(3).Infof("nodesScore: %v", proxier.nodesScore)
 
 	// Build IPVS rules for each service.
 	for svcPortName, svcPort := range proxier.serviceMap {
@@ -1939,6 +1985,10 @@ func (proxier *Proxier) syncEndpoint(svcPortName proxy.ServicePortName, onlyNode
 
 	// curEndpoints represents IPVS destinations listed from current system.
 	curEndpoints := sets.NewString()
+
+	// WAO: curWeight represents Node's IPVS weight
+	curWeight := map[string]int{}
+
 	curDests, err := proxier.ipvs.GetRealServers(appliedVirtualServer)
 	if err != nil {
 		klog.ErrorS(err, "Failed to list IPVS destinations")
@@ -1946,6 +1996,7 @@ func (proxier *Proxier) syncEndpoint(svcPortName proxy.ServicePortName, onlyNode
 	}
 	for _, des := range curDests {
 		curEndpoints.Insert(des.String())
+		curWeight[des.String()] = des.Weight // WAO: get current IPVS weight
 	}
 
 	endpoints := proxier.endpointsMap[svcPortName]
@@ -1987,6 +2038,11 @@ func (proxier *Proxier) syncEndpoint(svcPortName proxy.ServicePortName, onlyNode
 		newEndpoints.Insert(epInfo.String())
 	}
 
+	// WAO
+	newWeight := proxier.CalcWeight(newEndpoints.List())
+	klog.V(4).Infof("curWeight: %v", curWeight)
+	klog.V(4).Infof("newWeight: %v", newWeight)
+
 	// Create new endpoints
 	for _, ep := range newEndpoints.List() {
 		ip, port, err := net.SplitHostPort(ep)
@@ -2000,13 +2056,29 @@ func (proxier *Proxier) syncEndpoint(svcPortName proxy.ServicePortName, onlyNode
 			continue
 		}
 
+		// WAO: get weight for Endpoint `ep`
+		weight := 1
+		if val, ok := newWeight[ep]; ok {
+			weight = val
+		}
+
 		newDest := &utilipvs.RealServer{
 			Address: netutils.ParseIPSloppy(ip),
 			Port:    uint16(portNum),
-			Weight:  1,
+			Weight:  weight, // WAO: set the weight instead of 1
 		}
 
 		if curEndpoints.Has(ep) {
+			// WAO: Update ipvs weight, if the calculated weights are different from the weights in ipvs.
+			if weight != curWeight[ep] {
+				err = proxier.ipvs.UpdateRealServer(appliedVirtualServer, newDest)
+				if err != nil {
+					klog.Errorf("Failed to update real server: %v, error: %v", newDest, err)
+					continue
+				}
+				klog.V(5).Infof("Update real server weight %v: %v -> %v", newDest, curWeight[ep], weight)
+				continue
+			}
 			// check if newEndpoint is in gracefulDelete list, if true, delete this ep immediately
 			uniqueRS := GetUniqueRSName(vs, newDest)
 			if !proxier.gracefuldeleteManager.InTerminationList(uniqueRS) {
